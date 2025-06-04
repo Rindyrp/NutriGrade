@@ -348,12 +348,54 @@ def main():
                         nutrients = analyzer.extract_nutrients_from_text(extracted_text)
         
         elif input_method == "📸 Kamera":
-            st.info("💡 Fitur kamera akan tersedia dalam versi production dengan streamlit-camera-input")
+            st.markdown("""
+            <div class="camera-container">
+                <h3>📸 Ambil Foto dengan Kamera</h3>
+                <p>Gunakan kamera untuk mengambil foto label nutrisi</p>
+            </div>
+            """, unsafe_allow_html=True)
             
-            # Placeholder untuk demo
-            if st.button("📸 Simulasi Capture"):
-                sample_text = "Nutrition Facts\nTotal Sugar: 8g\nSodium: 450mg\nSaturated Fat: 1.5g"
-                nutrients = analyzer.extract_nutrients_from_text(sample_text)
+            # Camera input using streamlit's camera_input
+            camera_photo = st.camera_input("Ambil foto label nutrisi:")
+            
+            if camera_photo is not None:
+                # Display the captured image
+                image = Image.open(camera_photo)
+                st.image(image, caption="Foto dari kamera", use_column_width=True)
+                
+                # Analysis button
+                if st.button("🔍 Analisis Foto Kamera", key="analyze_camera"):
+                    with st.spinner("Memproses foto..."):
+                        # Preprocess image
+                        processed_image = preprocess_image(image)
+                        
+                        # Show processed image
+                        st.subheader("🔧 Gambar Setelah Preprocessing:")
+                        st.image(processed_image, caption="Gambar yang diproses", use_column_width=True)
+                        
+                        # OCR simulation
+                        extracted_text = simulate_ocr(processed_image)
+                        
+                        st.subheader("📄 Teks yang Diekstrak:")
+                        st.text_area("OCR Result:", extracted_text, height=100, key="camera_ocr")
+                        
+                        # Extract nutrients
+                        nutrients = analyzer.extract_nutrients_from_text(extracted_text)
+                        
+                        st.success("✅ Foto berhasil dianalisis!")
+            
+            # Alternative: Manual camera instructions
+            st.markdown("""
+            <div class="info-box">
+                <strong>💡 Tips untuk Foto yang Baik:</strong>
+                <ul>
+                    <li>Pastikan label nutrisi terlihat jelas</li>
+                    <li>Hindari bayangan atau pantulan</li>
+                    <li>Foto dalam kondisi pencahayaan yang cukup</li>
+                    <li>Posisikan kamera tegak lurus dengan label</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)      
         
         elif input_method == "📝 Input Manual":
             st.subheader("Input Nilai Gizi Manual")
