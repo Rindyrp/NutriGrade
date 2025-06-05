@@ -3,7 +3,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import re
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -11,6 +11,8 @@ import json
 from typing import Dict, List, Tuple, Optional
 import io
 import base64
+import pytesseract
+import easyocr
 
 # Konfigurasi halaman
 st.set_page_config(
@@ -89,18 +91,21 @@ class NutrientAnalyzer:
         nutrients = {'sugar': 0, 'sodium': 0, 'saturated_fat': 0}
         text = text.lower()
         
-        # Pattern untuk menangkap angka dengan satuan
+        # Pattern untuk menangkap angka dengan satuan, termasuk desimal, variasi spasi, dan tanda baca
         patterns = {
-            'sugar': r'(?:' + '|'.join(self.nutrient_aliases['sugar']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*g',
-            'sodium': r'(?:' + '|'.join(self.nutrient_aliases['sodium']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*mg',
-            'saturated_fat': r'(?:' + '|'.join(self.nutrient_aliases['saturated_fat']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*g'
+            'sugar': r'(?:' + '|'.join(self.nutrient_aliases['sugar']) + r')\s*[:=]?\s*(\d+\.?\d*|\.\d+)\s*(?:g|gram|grams)?(?:\s|$|\b)',
+            'sodium': r'(?:' + '|'.join(self.nutrient_aliases['sodium']) + r')\s*[:=]?\s*(\d+\.?\d*|\.\d+)\s*(?:mg|milligram|milligrams)?(?:\s|$|\b)',
+            'saturated_fat': r'(?:' + '|'.join(self.nutrient_aliases['saturated_fat']) + r')\s*[:=]?\s*(\d+\.?\d*|\.\d+)\s*(?:g|gram|grams)?(?:\s|$|\b)'
         }
         
         for nutrient, pattern in patterns.items():
             matches = re.findall(pattern, text, re.IGNORECASE)
             if matches:
-                # Ambil nilai tertinggi jika ada multiple matches
-                nutrients[nutrient] = max([float(match) for match in matches])
+                try:
+                    valid_matches = [float(match) for match in matches if match.strip()]
+                    nutrients[nutrient] = max(valid_matches) if valid_matches else 0
+                except ValueError:
+                    nutrients[nutrient] = 0  # Default ke 0 jika konversi gagal
         
         return nutrients
     
@@ -165,41 +170,150 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     # Convert ke array numpy
     img_array = np.array(image)
     
+    # Resize gambar untuk meningkatkan resolusi teks
+    scale_factor = 2.0
+    height, width = img_array.shape[:2]
+    img_array = cv2.resize(img_array, (int(width * scale_factor), int(height * scale_factor)), interpolation=cv2.INTER_CUBIC)
+    
     # Convert ke grayscale jika berwarna
     if len(img_array.shape) == 3:
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else:
         gray = img_array
     
-    # Noise reduction
-    denoised = cv2.medianBlur(gray, 3)
+    # Noise reduction dengan Gaussian blur ringan
+    denoised = cv2.GaussianBlur(gray, (3, 3), 0)
     
-    # Contrast enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    # Contrast enhancement menggunakan CLAHE
+    clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(16, 16))
     enhanced = clahe.apply(denoised)
     
-    # Thresholding
-    _, threshold = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Adaptive thresholding dengan parameter sensitif
+    binary = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 31, 15
+    )
     
-    return Image.fromarray(threshold)
+    # Morphological operations untuk memperkuat teks
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(binary, kernel, iterations=2)
+    eroded = cv2.erode(dilated, kernel, iterations=1)
+    
+    return Image.fromarray(eroded)
 
-def simulate_ocr(image: Image.Image) -> str:
-    """Simulasi OCR - dalam implementasi nyata, gunakan EasyOCR atau Tesseract"""
-    # Ini adalah simulasi - replace dengan OCR engine sebenarnya
-    sample_texts = [
-        "Nutrition Facts\nTotal Sugar: 12g\nSodium: 850mg\nSaturated Fat: 3.2g",
-        "Informasi Nilai Gizi\nGula Total: 8g\nNatrium: 450mg\nLemak Jenuh: 1.5g",
-        "Kandungan Gizi\nSucrose: 15g\nGaram: 920mg\nLemak Trans: 2.1g"
-    ]
+def detect_and_crop_nutrition_label(image: Image.Image) -> Image.Image:
+    """Deteksi dan crop area label nutrisi secara otomatis"""
+    opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
     
-    # Return random sample text for demo
-    import random
-    return random.choice(sample_texts)
+    # Preprocessing untuk deteksi tepi
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blurred, 30, 150, apertureSize=3)
+    
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Filter contours berdasarkan area, aspect ratio, dan kepadatan teks
+    potential_labels = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area > 25000:  # Area minimum lebih besar
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = w / h
+            
+            # Periksa kepadatan teks
+            roi = gray[y:y+h, x:x+w]
+            _, binary = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            text_density = np.sum(binary == 255) / (w * h)
+            
+            if 0.1 < aspect_ratio < 5.0 and w > 350 and h > 350 and 0.03 < text_density < 0.6:
+                potential_labels.append((x, y, w, h, area))
+    
+    if potential_labels:
+        # Ambil kontour dengan area terbesar
+        x, y, w, h, _ = max(potential_labels, key=lambda x: x[4])
+        
+        # Add padding besar
+        padding = 50
+        x = max(0, x - padding)
+        y = max(0, y - padding)
+        w = min(opencv_image.shape[1] - x, w + 2*padding)
+        h = min(opencv_image.shape[0] - y, h + 2*padding)
+        
+        # Crop image
+        cropped = opencv_image[y:y+h, x:x+w]
+        return Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
+    
+    st.warning("⚠️ Tidak dapat mendeteksi area label. Menggunakan gambar asli.")
+    return image
+
+def enhance_text_regions(image: Image.Image) -> Image.Image:
+    """Enhance regions yang kemungkinan mengandung teks"""
+    # Sharpen image dengan parameter kuat
+    sharpened = image.filter(ImageFilter.UnsharpMask(radius=4, percent=300, threshold=1))
+    
+    # Enhance contrast
+    enhancer = ImageEnhance.Contrast(sharpened)
+    contrasted = enhancer.enhance(3.0)
+    
+    # Enhance brightness secara adaptif
+    enhancer = ImageEnhance.Brightness(contrasted)
+    brightened = enhancer.enhance(1.4)
+    
+    return brightened
+
+def preprocess_nutrition_label(image: Image.Image) -> Tuple[Image.Image, Image.Image, Image.Image]:
+    """Pipeline lengkap preprocessing untuk label nutrisi"""
+    try:
+        # Step 1: Detect and crop nutrition label area
+        st.write("🔍 Mendeteksi area label nutrisi...")
+        cropped_image = detect_and_crop_nutrition_label(image)
+        
+        # Step 2: Enhance text regions
+        st.write("✨ Meningkatkan kualitas teks...")
+        enhanced_image = enhance_text_regions(cropped_image)
+        
+        # Step 3: Advanced preprocessing
+        st.write("🔧 Memproses gambar untuk OCR...")
+        processed_image = preprocess_image(enhanced_image)
+        
+        return processed_image, cropped_image, enhanced_image
+    
+    except Exception as e:
+        st.error(f"Error dalam preprocessing: {str(e)}")
+        return image, image, image
+
+def perform_ocr(image: Image.Image) -> str:
+    """Melakukan OCR menggunakan Tesseract dan EasyOCR untuk akurasi maksimal"""
+    try:
+        # Convert PIL Image ke numpy array
+        img_array = np.array(image)
+        
+        # Tesseract OCR dengan custom configuration
+        custom_config = r'--oem 3 --psm 6 -l eng+ind'  # OEM 3 (LSTM), PSM 6 (block of text), bahasa Inggris+Indonesia
+        tesseract_text = pytesseract.image_to_string(img_array, config=custom_config)
+        
+        # EasyOCR sebagai fallback
+        reader = easyocr.Reader(['en', 'id'], gpu=False)
+        easyocr_results = reader.readtext(img_array, detail=0, paragraph=True, 
+                                         contrast_ths=0.1, adjust_contrast=0.5, 
+                                         text_threshold=0.7, low_text=0.3, mag_ratio=2.0)
+        easyocr_text = " ".join(easyocr_results)
+        
+        # Gabungkan hasil, prioritaskan Tesseract jika valid
+        if tesseract_text.strip() and len(tesseract_text) > len(easyocr_text):
+            extracted_text = tesseract_text
+        else:
+            extracted_text = easyocr_text
+        
+        return extracted_text if extracted_text.strip() else "Tidak ada teks yang terdeteksi"
+    
+    except Exception as e:
+        st.error(f"Error dalam OCR: {str(e)}")
+        return "Gagal mengekstrak teks"
 
 def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer):
     """Membuat visualisasi hasil analisis"""
-    
-    # Buat subplot
     fig = make_subplots(
         rows=2, cols=2,
         subplot_titles=('', 'WHO Daily Limit Comparison', 
@@ -334,162 +448,30 @@ def main():
                 st.image(image, caption="Gambar yang diupload", use_column_width=True)
                 
                 if st.button("🔍 Analisis Gambar"):
-                    with st.spinner("Memproses gambar..."):
+                    with st.spinner("Memproses gambar dengan computer vision dan deep learning..."):
                         # Preprocess image
-                        processed_image = preprocess_image(image)
+                        processed_image, cropped_image, enhanced_image = preprocess_nutrition_label(image)
                         
-                        # OCR simulation
-                        extracted_text = simulate_ocr(processed_image)
+                        # Show processing steps
+                        st.subheader("🔧 Hasil Preprocessing")
+                        tab1, tab2, tab3 = st.tabs(["Cropped", "Enhanced", "Final"])
+                        with tab1:
+                            st.image(cropped_image, caption="Area label yang terdeteksi", use_column_width=True)
+                        with tab2:
+                            st.image(enhanced_image, caption="Gambar yang ditingkatkan", use_column_width=True)
+                        with tab3:
+                            st.image(processed_image, caption="Siap untuk OCR", use_column_width=True)
+                        
+                        # Perform OCR
+                        extracted_text = perform_ocr(processed_image)
                         
                         st.subheader("📄 Teks yang Diekstrak:")
-                        st.text_area("OCR Result:", extracted_text, height=100)
+                        st.text_area("OCR Result:", extracted_text, height=150)
                         
                         # Extract nutrients
                         nutrients = analyzer.extract_nutrients_from_text(extracted_text)
+        
         elif input_method == "📸 Kamera":
-            import cv2
-            import numpy as np
-            from PIL import Image, ImageEnhance, ImageFilter
-            
-            def advanced_preprocess_image(image):
-            """
-            Advanced preprocessing untuk meningkatkan akurasi OCR pada label nutrisi
-            """
-            # Convert PIL to OpenCV format
-            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            
-            # 1. Resize image jika terlalu kecil atau besar
-            height, width = opencv_image.shape[:2]
-            if width < 800:
-                scale_factor = 800 / width
-                new_width = int(width * scale_factor)
-                new_height = int(height * scale_factor)
-                opencv_image = cv2.resize(opencv_image, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
-            elif width > 2000:
-                scale_factor = 2000 / width
-                new_width = int(width * scale_factor)
-                new_height = int(height * scale_factor)
-                opencv_image = cv2.resize(opencv_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
-            
-            # 2. Convert to grayscale
-            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-            
-            # 3. Noise reduction dengan bilateral filter
-            denoised = cv2.bilateralFilter(gray, 9, 75, 75)
-            
-            # 4. Contrast enhancement menggunakan CLAHE
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            enhanced = clahe.apply(denoised)
-            
-            # 5. Morphological operations untuk membersihkan noise
-            kernel = np.ones((2,2), np.uint8)
-            cleaned = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
-            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
-            
-            # 6. Adaptive thresholding untuk binarization yang lebih baik
-            binary = cv2.adaptiveThreshold(
-                cleaned, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY, 11, 2
-            )
-            
-            # 7. Dilation untuk memperkuat teks
-            kernel_dilate = np.ones((1,1), np.uint8)
-            dilated = cv2.dilate(binary, kernel_dilate, iterations=1)
-            
-            # Convert back to PIL
-            processed_pil = Image.fromarray(dilated)
-            
-            return processed_pil
-        
-        def detect_and_crop_nutrition_label(image):
-            """
-            Deteksi dan crop area label nutrisi secara otomatis
-            """
-            opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
-            
-            # Edge detection
-            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-            
-            # Find contours
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Filter contours berdasarkan area dan aspect ratio
-            potential_labels = []
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > 10000:  # Minimum area threshold
-                    x, y, w, h = cv2.boundingRect(contour)
-                    aspect_ratio = w / h
-                    
-                    # Label nutrisi biasanya berbentuk persegi panjang vertikal atau horizontal
-                    if 0.3 < aspect_ratio < 3.0 and w > 200 and h > 200:
-                        potential_labels.append((x, y, w, h, area))
-            
-            if potential_labels:
-                # Ambil kontour dengan area terbesar
-                x, y, w, h, _ = max(potential_labels, key=lambda x: x[4])
-                
-                # Add padding
-                padding = 20
-                x = max(0, x - padding)
-                y = max(0, y - padding)
-                w = min(opencv_image.shape[1] - x, w + 2*padding)
-                h = min(opencv_image.shape[0] - y, h + 2*padding)
-                
-                # Crop image
-                cropped = opencv_image[y:y+h, x:x+w]
-                cropped_pil = Image.fromarray(cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB))
-                
-                return cropped_pil
-            
-            return image  # Return original if no suitable contour found
-        
-        def enhance_text_regions(image):
-            """
-            Enhance regions yang kemungkinan mengandung teks
-            """
-            # Convert to PIL untuk enhancement
-            if isinstance(image, np.ndarray):
-                image = Image.fromarray(image)
-            
-            # Sharpen image
-            sharpened = image.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
-            
-            # Enhance contrast
-            enhancer = ImageEnhance.Contrast(sharpened)
-            contrasted = enhancer.enhance(1.5)
-            
-            # Enhance brightness jika gambar terlalu gelap
-            enhancer = ImageEnhance.Brightness(contrasted)
-            brightened = enhancer.enhance(1.1)
-            
-            return brightened
-        
-        def preprocess_nutrition_label(image):
-            """
-            Pipeline lengkap preprocessing untuk label nutrisi
-            """
-            try:
-                # Step 1: Detect and crop nutrition label area
-                st.write("🔍 Mendeteksi area label nutrisi...")
-                cropped_image = detect_and_crop_nutrition_label(image)
-                
-                # Step 2: Enhance text regions
-                st.write("✨ Meningkatkan kualitas teks...")
-                enhanced_image = enhance_text_regions(cropped_image)
-                
-                # Step 3: Advanced preprocessing
-                st.write("🔧 Memproses gambar untuk OCR...")
-                processed_image = advanced_preprocess_image(enhanced_image)
-                
-                return processed_image, cropped_image, enhanced_image
-                
-            except Exception as e:
-                st.error(f"Error dalam preprocessing: {str(e)}")
-                return image, image, image
-        
-            # Updated camera section dengan preprocessing yang diperbaiki
             st.markdown("""
             <div class="camera-container">
                 <h3>📸 Ambil Foto dengan Kamera</h3>
@@ -511,28 +493,23 @@ def main():
                 
                 # Analysis button
                 if st.button("🔍 Analisis Foto Kamera", key="analyze_camera"):
-                    with st.spinner("Memproses foto dengan AI..."):
+                    with st.spinner("Memproses foto dengan computer vision dan deep learning..."):
                         # Advanced preprocessing
                         processed_image, cropped_image, enhanced_image = preprocess_nutrition_label(image)
                         
                         # Show processing steps
                         with col2:
                             st.subheader("🔧 Hasil Preprocessing")
-                            
-                            # Tabs untuk menampilkan berbagai tahap preprocessing
                             tab1, tab2, tab3 = st.tabs(["Cropped", "Enhanced", "Final"])
-                            
                             with tab1:
                                 st.image(cropped_image, caption="Area label yang terdeteksi", use_column_width=True)
-                            
                             with tab2:
                                 st.image(enhanced_image, caption="Gambar yang ditingkatkan", use_column_width=True)
-                            
                             with tab3:
                                 st.image(processed_image, caption="Siap untuk OCR", use_column_width=True)
                         
-                        # OCR simulation dengan gambar yang sudah diproses
-                        extracted_text = simulate_advanced_ocr(processed_image)
+                        # Perform OCR
+                        extracted_text = perform_ocr(processed_image)
                         
                         st.subheader("📄 Teks yang Diekstrak:")
                         st.text_area("OCR Result:", extracted_text, height=150, key="camera_ocr")
@@ -542,29 +519,15 @@ def main():
                         
                         if nutrients:
                             st.subheader("🥗 Informasi Nutrisi yang Terdeteksi:")
-                            
-                            # Display nutrients in a nice format
                             col1, col2, col3 = st.columns(3)
-                            
                             with col1:
-                                if 'kalori' in nutrients:
-                                    st.metric("Kalori", f"{nutrients['kalori']} kkal")
-                                if 'protein' in nutrients:
-                                    st.metric("Protein", f"{nutrients['protein']} g")
-                            
+                                st.metric("Gula", f"{nutrients['sugar']:.1f} g")
                             with col2:
-                                if 'lemak' in nutrients:
-                                    st.metric("Lemak", f"{nutrients['lemak']} g")
-                                if 'karbohidrat' in nutrients:
-                                    st.metric("Karbohidrat", f"{nutrients['karbohidrat']} g")
-                            
+                                st.metric("Sodium", f"{nutrients['sodium']:.1f} mg")
                             with col3:
-                                if 'gula' in nutrients:
-                                    st.metric("Gula", f"{nutrients['gula']} g")
-                                if 'sodium' in nutrients:
-                                    st.metric("Sodium", f"{nutrients['sodium']} mg")
+                                st.metric("Lemak Jenuh", f"{nutrients['saturated_fat']:.1f} g")
                     
-                    st.success("✅ Foto berhasil dianalisis dengan preprocessing yang ditingkatkan!")
+                    st.success("✅ Foto berhasil dianalisis dengan computer vision dan deep learning!")
             
             # Tips section
             st.markdown("""
@@ -625,6 +588,14 @@ def main():
             **Lemak Jenuh:**
             - Saturated Fat, Lemak Jenuh
             - Trans Fat, Lemak Trans
+            """)
+        
+        # Deep learning note
+        with st.expander("🤖 Tentang Deep Learning"):
+            st.markdown("""
+            - **Deteksi Label**: Kami menggunakan computer vision untuk mendeteksi area label nutrisi.
+            - **OCR**: Tesseract (berbasis LSTM) dan EasyOCR digabungkan untuk ekstraksi teks yang akurat.
+            - **Saran**: Untuk akurasi maksimal, latih model YOLO dengan dataset label nutrisi untuk deteksi area yang lebih presisi.
             """)
     
     # Results section
@@ -724,7 +695,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; color: #666; padding: 2rem;">
         <p>🏷️ NutriGrade Vision | Membantu Anda Membuat Pilihan Makanan atau Minuman yang Lebih Sehat</p>
-        <p><small>Dikembangkan dengan ❤️ menggunakan Streamlit & Python</small></p>
+        <p><small>Dikembangkan dengan ❤️ menggunakan Streamlit, Python, & Deep Learning</small></p>
     </div>
     """, unsafe_allow_html=True)
 
