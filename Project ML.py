@@ -280,7 +280,7 @@ def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>🏷️ NutriGrade Vision</h1>
+        <h1>🏷️ Nutri Vision</h1>
         <p>Aplikasi Pendeteksi Kandungan Gizi Negatif dari Kemasan Makanan atau Minuman</p>
     </div>
     """, unsafe_allow_html=True)
