@@ -3,460 +3,503 @@ import cv2
 import numpy as np
 import pandas as pd
 import re
-from PIL import Image, ImageEnhance, ImageFilter
-import tensorflow as tf
-from tensorflow import keras
-import torch
-import torchvision.transforms as transforms
-from sklearn.model_selection import train_test_split
-import easyocr
-import paddleocr
-import pytesseract
-from typing import Dict, List, Tuple, Optional, Any
+from PIL import Image
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import json
-import logging
-from dataclasses import dataclass
-from pathlib import Path
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import ndimage
-from skimage import filters, morphology, segmentation
-import warnings
-warnings.filterwarnings('ignore')
+from typing import Dict, List, Tuple, Optional
+import io
+import base64
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Konfigurasi halaman
+st.set_page_config(
+    page_title="🏷️ NutriGrade Vision",
+    page_icon="🏷️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-@dataclass
-class OCRConfig:
-    """Konfigurasi sistem OCR"""
-    model_type: str = "paddleocr"
-    language: List[str] = None
-    use_gpu: bool = False
-    confidence_threshold: float = 0.5
-    preprocessing_enabled: bool = True
-    postprocessing_enabled: bool = True
-    
-    def __post_init__(self):
-        if self.language is None:
-            self.language = ['id', 'en']
+# Custom CSS untuk styling
+st.markdown("""
+<style>
+    .main-header {
+        text-align: center;
+        padding: 2rem 0;
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border-radius: 10px;
+        margin-bottom: 2rem;
+    }
+    .grade-card {
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+        text-align: center;
+        font-weight: bold;
+    }
+    .grade-a { background-color: #d4edda; color: #155724; }
+    .grade-b { background-color: #fff3cd; color: #856404; }
+    .grade-c { background-color: #f8d7da; color: #721c24; }
+    .grade-d { background-color: #f5c6cb; color: #491217; }
+    .warning-box {
+        padding: 1rem;
+        border-left: 4px solid #ff6b6b;
+        background-color: #ffe0e0;
+        margin: 1rem 0;
+    }
+    .info-box {
+        padding: 1rem;
+        border-left: 4px solid #4ecdc4;
+        background-color: #e0f7fa;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-class AdvancedImagePreprocessor:
-    """Preprocessing gambar tingkat lanjut untuk OCR label gizi"""
-    
+class NutrientAnalyzer:
     def __init__(self):
-        self.setup_filters()
+        # Definisi nama alternatif nutrisi
+        self.nutrient_aliases = {
+            'sugar': ['total sugar', 'total sugars', 'sucrose', 'glucose', 'fructose', 
+                     'corn syrup', 'added sugar', 'madu', 'sirup', 'fruktosa', 
+                     'glukosa', 'sukrosa', 'dextrose', 'maltose', 'gula'],
+            'sodium': ['sodium', 'natrium', 'na', 'salt', 'garam', 
+                      'monosodium glutamate', 'msg'],
+            'saturated_fat': ['saturated fat', 'lemak jenuh', 'saturates', 
+                            'lemak trans', 'trans fat']
+        }
+        
+        # Threshold untuk grading
+        self.thresholds = {
+            'sugar': {'A': 1, 'B': 5, 'C': 10},
+            'sodium': {'A': 300, 'B': 340, 'C': 370},
+            'saturated_fat': {'A': 0.7, 'B': 1.2, 'C': 2.8}
+        }
+        
+        # Batas harian WHO
+        self.who_limits = {
+            'sugar': 25,  # gram
+            'sodium': 2000,  # mg
+            'saturated_fat': 20  # gram (untuk diet 2000 kcal)
+        }
     
-    def setup_filters(self):
-        """Menyiapkan filter dan kernel"""
-        self.sharpen_kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        self.edge_kernel = np.array([[-1,-1,-1,-1,-1], [-1,2,2,2,-1], [-1,2,8,2,-1], [-1,2,2,2,-1], [-1,-1,-1,-1,-1]]) / 8.0
+    def extract_nutrients_from_text(self, text: str) -> Dict[str, float]:
+        """Ekstrak nilai nutrisi dari teks menggunakan regex"""
+        nutrients = {'sugar': 0, 'sodium': 0, 'saturated_fat': 0}
+        text = text.lower()
+        
+        # Pattern untuk menangkap angka dengan satuan
+        patterns = {
+            'sugar': r'(?:' + '|'.join(self.nutrient_aliases['sugar']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*g',
+            'sodium': r'(?:' + '|'.join(self.nutrient_aliases['sodium']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*mg',
+            'saturated_fat': r'(?:' + '|'.join(self.nutrient_aliases['saturated_fat']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*g'
+        }
+        
+        for nutrient, pattern in patterns.items():
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                # Ambil nilai tertinggi jika ada multiple matches
+                nutrients[nutrient] = max([float(match) for match in matches])
+        
+        return nutrients
     
-    def camera_calibration_correction(self, image, camera_matrix=None, dist_coeffs=None):
-        if camera_matrix and dist_coeffs:
-            h, w = image.shape[:2]
-            new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(camera_matrix, dist_coeffs, (w, h), 1, (w, h))
-            undistorted = cv2.undistort(image, camera_matrix, dist_coeffs, None, new_camera_matrix)
-            x, y, w, h = roi
-            return undistorted[y:y+h, x:x+w]
-        return image
-    
-    def detect_document_corners(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blurred, 50, 200, apertureSize=3)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
-            epsilon = 0.02 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True)
-            if len(approx) == 4:
-                return approx.reshape(4, 2)
-        return None
-    
-    def perspective_correction(self, image):
-        corners = self.detect_document_corners(image)
-        if corners is None:
-            return image
-        corners = self.order_corners(corners)
-        width_a = np.sqrt(((corners[2][0] - corners[3][0]) ** 2) + ((corners[2][1] - corners[3][1]) ** 2))
-        width_b = np.sqrt(((corners[1][0] - corners[0][0]) ** 2) + ((corners[1][1] - corners[0][1]) ** 2))
-        max_width = max(int(width_a), int(width_b))
-        height_a = np.sqrt(((corners[1][0] - corners[2][0]) ** 2) + ((corners[1][1] - corners[2][1]) ** 2))
-        height_b = np.sqrt(((corners[0][0] - corners[3][0]) ** 2) + ((corners[0][1] - corners[3][1]) ** 2))
-        max_height = max(int(height_a), int(height_b))
-        dst = np.array([[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]], dtype="float32")
-        matrix = cv2.getPerspectiveTransform(corners.astype("float32"), dst)
-        return cv2.warpPerspective(image, matrix, (max_width, max_height))
-    
-    def order_corners(self, corners):
-        rect = np.zeros((4, 2), dtype="float32")
-        s = corners.sum(axis=1)
-        rect[0] = corners[np.argmin(s)]
-        rect[2] = corners[np.argmax(s)]
-        diff = np.diff(corners, axis=1)
-        rect[1] = corners[np.argmin(diff)]
-        rect[3] = corners[np.argmax(diff)]
-        return rect
-    
-    def adaptive_lighting_correction(self, image):
-        if len(image.shape) == 3:
-            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            l = clahe.apply(l)
-            enhanced = cv2.merge([l, a, b])
-            return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+    def get_grade(self, nutrient: str, value: float) -> str:
+        """Menentukan grade berdasarkan nilai nutrisi"""
+        thresholds = self.thresholds[nutrient]
+        
+        if value <= thresholds['A']:
+            return 'A'
+        elif value <= thresholds['B']:
+            return 'B'
+        elif value <= thresholds['C']:
+            return 'C'
         else:
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            return clahe.apply(image)
+            return 'D'
     
-    def remove_glare_and_shadows(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-        opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
-        result = cv2.absdiff(gray, opened)
-        return cv2.normalize(result, None, 0, 255, cv2.NORM_MINMAX)
+    def get_grade_color(self, grade: str) -> str:
+        """Mengembalikan warna berdasarkan grade"""
+        colors = {'A': '#28a745', 'B': '#ffc107', 'C': '#fd7e14', 'D': '#dc3545'}
+        return colors.get(grade, '#6c757d')
     
-    def advanced_denoising(self, image):
-        if len(image.shape) == 3:
-            denoised = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
-        else:
-            denoised = cv2.fastNlMeansDenoising(image, None, 10, 7, 21)
-        return cv2.bilateralFilter(denoised, 9, 75, 75)
+    def get_grade_emoji(self, grade: str) -> str:
+        """Mengembalikan emoji berdasarkan grade"""
+        emojis = {'A': '✅', 'B': '🟡', 'C': '🟠', 'D': '🔴'}
+        return emojis.get(grade, '⚪')
     
-    def enhance_text_contrast(self, image):
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        adaptive_mean = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 11, 2)
-        adaptive_gaussian = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        return cv2.bitwise_and(otsu, cv2.bitwise_and(adaptive_mean, adaptive_gaussian))
+    def calculate_who_percentage(self, nutrient: str, value: float) -> float:
+        """Menghitung persentase dari batas harian WHO"""
+        return (value / self.who_limits[nutrient]) * 100
     
-    def apply_sharpening(self, image):
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
-        gaussian = cv2.GaussianBlur(gray, (0, 0), 2.0)
-        unsharp_mask = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
-        return cv2.filter2D(unsharp_mask, -1, self.sharpen_kernel)
-    
-    def preprocess_pipeline(self, image, **kwargs):
-        processed = image.copy()
-        if 'camera_matrix' in kwargs and 'dist_coeffs' in kwargs:
-            processed = self.camera_calibration_correction(processed, kwargs['camera_matrix'], kwargs['dist_coeffs'])
-        processed = self.perspective_correction(processed)
-        processed = self.adaptive_lighting_correction(processed)
-        processed = self.remove_glare_and_shadows(processed)
-        processed = self.advanced_denoising(processed)
-        processed = self.apply_sharpening(processed)
-        processed = self.enhance_text_contrast(processed)
-        return processed
+    def get_health_recommendation(self, nutrients: Dict[str, float], condition: str) -> List[str]:
+        """Memberikan rekomendasi berdasarkan kondisi kesehatan"""
+        recommendations = []
+        
+        if condition == "Diabetes Mellitus":
+            if nutrients['sugar'] > 5:
+                recommendations.append("⚠️ TIDAK DIREKOMENDASIKAN: Kandungan gula terlalu tinggi untuk penderita diabetes")
+            elif nutrients['sugar'] > 1:
+                recommendations.append("⚡ PERHATIAN: Konsumsi gula harus dibatasi")
+        
+        elif condition == "Hipertensi":
+            if nutrients['sodium'] > 340:
+                recommendations.append("⚠️ TIDAK DIREKOMENDASIKAN: Kandungan sodium terlalu tinggi untuk penderita hipertensi")
+            elif nutrients['sodium'] > 300:
+                recommendations.append("⚡ PERHATIAN: Konsumsi sodium harus dibatasi")
+        
+        elif condition == "Dislipidemia":
+            if nutrients['saturated_fat'] > 1.2:
+                recommendations.append("⚠️ TIDAK DIREKOMENDASIKAN: Kandungan lemak jenuh terlalu tinggi")
+            elif nutrients['saturated_fat'] > 0.7:
+                recommendations.append("⚡ PERHATIAN: Konsumsi lemak jenuh harus dibatasi")
+        
+        elif condition == "Anak-anak":
+            total_bad_grades = sum(1 for nutrient in nutrients if self.get_grade(nutrient, nutrients[nutrient]) in ['C', 'D'])
+            if total_bad_grades > 0:
+                recommendations.append("⚠️ TIDAK DIREKOMENDASIKAN: Produk ini tidak cocok untuk anak-anak")
+        
+        return recommendations
 
-class MultiModelOCR:
-    """Sistem OCR multi-model dengan kemampuan ensemble"""
+def preprocess_image(image: Image.Image) -> Image.Image:
+    """Preprocessing gambar untuk meningkatkan akurasi OCR"""
+    # Convert ke array numpy
+    img_array = np.array(image)
     
-    def __init__(self, config):
-        self.config = config
-        self.models = {}
-        self.initialize_models()
+    # Convert ke grayscale jika berwarna
+    if len(img_array.shape) == 3:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_array
     
-    def initialize_models(self):
-        if self.config.model_type in ["paddleocr", "ensemble"]:
-            self.models['paddleocr'] = paddleocr.PaddleOCR(use_angle_cls=True, lang=self.config.language[0], use_gpu=self.config.use_gpu, show_log=False)
-        if self.config.model_type in ["easyocr", "ensemble"]:
-            self.models['easyocr'] = easyocr.Reader(self.config.language, gpu=self.config.use_gpu)
-        if self.config.model_type in ["tesseract", "ensemble"]:
-            self.tesseract_config = '--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.,()%:-/ '
+    # Noise reduction
+    denoised = cv2.medianBlur(gray, 3)
     
-    def extract_with_paddleocr(self, image):
-        results = self.models['paddleocr'].ocr(image, cls=True)
-        extracted_data = []
-        for line in results[0] if results[0] else []:
-            bbox, text_info = line
-            text, confidence = text_info
-            if confidence >= self.config.confidence_threshold:
-                extracted_data.append({'text': text, 'confidence': confidence, 'bbox': bbox, 'model': 'paddleocr'})
-        return extracted_data
+    # Contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(denoised)
     
-    def extract_with_easyocr(self, image):
-        results = self.models ait['easyocr'].readtext(image)
-        extracted_data = []
-        for bbox, text, confidence in results:
-            if confidence >= self.config.confidence_threshold:
-                extracted_data.append({'text': text, 'confidence': confidence, 'bbox': bbox, 'model': 'easyocr'})
-        return extracted_data
+    # Thresholding
+    _, threshold = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    def extract_with_tesseract(self, image):
-        data = pytesseract.image_to_data(image, config=self.tesseract_config, output_type=pytesseract.Output.DICT)
-        extracted_data = []
-        n_boxes = len(data['text'])
-        for i in range(n_boxes):
-            if int(data['conf'][i]) >= self.config.confidence_threshold * 100:
-                text = data['text'][i].strip()
-                if text:
-                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    bbox = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
-                    extracted_data.append({'text': text, 'confidence': int(data['conf'][i]) / 100.0, 'bbox': bbox, 'model': 'tesseract'})
-        return extracted_data
-    
-    def ensemble_extraction(self, image):
-        all_results = []
-        if 'paddleocr' in self.models:
-            all_results.extend(self.extract_with_paddleocr(image))
-        if 'easyocr' in self.models:
-            all_results.extend(self.extract_with_easyocr(image))
-        if self.config.model_type in ["tesseract", "ensemble"]:
-            all_results.extend(self.extract_with_tesseract(image))
-        return self.combine_results(all_results)
-    
-    def combine_results(self, results):
-        if not results:
-            return []
-        results.sort(key=lambda x: x['confidence'], reverse=True)
-        final_results = []
-        seen_texts = set()
-        for result in results:
-            text_clean = re.sub(r'\s+', ' ', result['text'].strip().lower())
-            if not any(self.text_similarity(text_clean, seen) > 0.8 for seen in seen_texts):
-                seen_texts.add(text_clean)
-                final_results.append(result)
-        return final_results
-    
-    def text_similarity(self, text1, text2):
-        def levenshtein_distance(s1, s2):
-            if len(s1) > len(s2):
-                s1, s2 = s2, s1
-            distances = range(len(s1) + 1)
-            for i2, c2 in enumerate(s2):
-                distances_ = [i2 + 1]
-                for i1, c1 in enumerate(s1):
-                    if c1 == c2:
-                        distances_.append(distances[i1])
-                    else:
-                        distances_.append(1 + min((distances[i1], distances[i1 + 1], distances_[-1])))
-                distances = distances_
-            return distances[-1]
-        max_len = max(len(text1), len(text2))
-        if max_len == 0:
-            return 1.0
-        distance = levenshtein_distance(text1, text2)
-        return 1 - (distance / max_len)
-    
-    def extract_text(self, image):
-        if self.config.model_type == "ensemble":
-            return self.ensemble_extraction(image)
-        elif self.config.model_type == "paddleocr":
-            return self.extract_with_paddleocr(image)
-        elif self.config.model_type == "easyocr":
-            return self.extract_with_easyocr(image)
-        elif self.config.model_type == "tesseract":
-            return self.extract_with_tesseract(image)
-        else:
-            raise ValueError(f"Unsupported model type: {self.config.model_type}")
+    return Image.fromarray(threshold)
 
-class NutritionPostProcessor:
-    """Post-processing tingkat lanjut untuk data label gizi"""
+def simulate_ocr(image: Image.Image) -> str:
+    """Simulasi OCR - dalam implementasi nyata, gunakan EasyOCR atau Tesseract"""
+    # Ini adalah simulasi - replace dengan OCR engine sebenarnya
+    sample_texts = [
+        "Nutrition Facts\nTotal Sugar: 12g\nSodium: 850mg\nSaturated Fat: 3.2g",
+        "Informasi Nilai Gizi\nGula Total: 8g\nNatrium: 450mg\nLemak Jenuh: 1.5g",
+        "Kandungan Gizi\nSucrose: 15g\nGaram: 920mg\nLemak Trans: 2.1g"
+    ]
     
-    def __init__(self):
-        self.setup_correction_rules()
-        self.setup_nutrition_patterns()
-    
-    def setup_correction_rules(self):
-        self.character_corrections = {
-            'O': '0', 'o': '0', 'l': '1', 'I': '1', 'S': '5', 's': '5',
-            'G': '6', 'g': '9', 'B': '8', 'Z': '2', 'z': '2',
-            'mq': 'mg', 'qm': 'gm', 'cal': 'kcal', 'keal': 'kcal'
-        }
-        self.unit_corrections = {
-            'mq': 'mg', 'qm': 'mg', 'mig': 'mg', 'mĝ': 'mg',
-            'qg': 'g', 'gq': 'g', 'ĝ': 'g',
-            'cal': 'kcal', 'keal': 'kcal', 'kCal': 'kcal'
-        }
-    
-    def setup_nutrition_patterns(self):
-        self.nutrition_patterns = {
-            'calories': [r'(?:kalori|calories?|energi|energy)\s*:?\s*(\d+(?:\.\d+)?)\s*(?:kkal|kcal|cal)?', 
-                         r'(\d+(?:\.\d+)?)\s*(?:kkal|kcal|cal)'],
-            'total_fat': [r'(?:lemak\s*total|total\s*fat|fat)\s*:?\s*(\d+(?:\.\d+)?)\s*g', 
-                          r'(?:lemak|fat)\s*:?\s*(\d+(?:\.\d+)?)\s*g'],
-            'saturated_fat': [r'(?:lemak\s*jenuh|saturated\s*fat|lemak\s*trans|trans\s*fat)\s*:?\s*(\d+(?:\.\d+)?)\s*g'],
-            'cholesterol': [r'(?:kolesterol|cholesterol)\s*:?\s*(\d+(?:\.\d+)?)\s*mg'],
-            'sodium': [r'(?:sodium|natrium|garam|salt)\s*:?\s*(\d+(?:\.\d+)?)\s*mg'],
-            'total_carbs': [r'(?:karbohidrat\s*total|total\s*carbohydrate|carbs?)\s*:?\s*(\d+(?:\.\d+)?)\s*g'],
-            'dietary_fiber': [r'(?:serat\s*pangan|dietary\s*fiber|fiber)\s*:?\s*(\d+(?:\.\d+)?)\s*g'],
-            'total_sugars': [r'(?:gula\s*total|total\s*sugar|sugar)\s*:?\s*(\d+(?:\.\d+)?)\s*g'],
-            'added_sugars': [r'(?:gula\s*tambahan|added\s*sugar)\s*:?\s*(\d+(?:\.\d+)?)\s*g'],
-            'protein': [r'(?:protein)\s*:?\s*(\d+(?:\.\d+)?)\s*g']
-        }
-    
-    def correct_common_errors(self, text):
-        corrected = text
-        for wrong, correct in self.character_corrections.items():
-            corrected = corrected.replace(wrong, correct)
-        for wrong, correct in self.unit_corrections.items():
-            corrected = re.sub(rf'\b{wrong}\b', correct, corrected, flags=re.IGNORECASE)
-        return corrected
-    
-    def extract_nutrition_values(self, text_data):
-        full_text = ' '.join([item['text'] for item in text_data])
-        full_text = self.correct_common_errors(full_text.lower())
-        nutrition_values = {}
-        for nutrient, patterns in self.nutrition_patterns.items():
-            for pattern in patterns:
-                matches = re.findall(pattern, full_text, re.IGNORECASE)
-                if matches:
-                    try:
-                        value = float(matches[0])
-                        nutrition_values[nutrient] = value
-                        break
-                    except (ValueError, IndexError):
-                        continue
-        return nutrition_values
-    
-    def validate_nutrition_values(self, values):
-        ranges = {
-            'calories': (0, 1000),
-            'total_fat': (0, 100),
-            'saturated_fat': (0, 50),
-            'cholesterol': (0, 1000),
-            'sodium': (0, 5000),
-            'total_carbs': (0, 100),
-            'dietary_fiber': (0, 50),
-            'total_sugars': (0, 100),
-            'added_sugars': (0, 100),
-            'protein': (0, 100)
-        }
-        return {k: v for k, v in values.items() if k in ranges and ranges[k][0] <= v <= ranges[k][1]}
-    
-    def structure_output(self, nutrition_values, original_data):
-        return {
-            'nutrition_facts': nutrition_values,
-            'raw_ocr_data': original_data,
-            'extraction_metadata': {
-                'total_text_items': len(original_data),
-                'average_confidence': np.mean([item['confidence'] for item in original_data]) if original_data else 0,
-                'models_used': list(set([item['model'] for item in original_data])) if original_data else [],
-                'processing_timestamp': pd.Timestamp.now().isoformat()
-            }
-        }
+    # Return random sample text for demo
+    import random
+    return random.choice(sample_texts)
 
-class EnhancedNutritionOCR:
-    """Kelas utama yang menggabungkan semua komponen"""
+def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer):
+    """Membuat visualisasi hasil analisis"""
     
-    def __init__(self, config=None):
-        self.config = config or OCRConfig()
-        self.preprocessor = AdvancedImagePreprocessor()
-        self.ocr_engine = MultiModelOCR(self.config)
-        self.postprocessor = NutritionPostProcessor()
+    # Buat subplot
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('', 'WHO Daily Limit Comparison', 
+                       'Nutrient Values', 'Health Risk Assessment'),
+        specs=[[{"type": "indicator"}, {"type": "bar"}],
+               [{"type": "scatter"}, {"type": "pie"}]]
+    )
     
-    def process_image(self, image_path, **kwargs):
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Could not load image: {image_path}")
-        return self.process_image_array(image, **kwargs)
+    # Grade overview (indicator)
+    grades = [analyzer.get_grade(nutrient, value) for nutrient, value in nutrients.items()]
+    grade_scores = {'A': 4, 'B': 3, 'C': 2, 'D': 1}
+    avg_score = sum(grade_scores[grade] for grade in grades) / len(grades)
     
-    def process_image_array(self, image, **kwargs):
-        if self.config.preprocessing_enabled:
-            processed_image = self.preprocessor.preprocess_pipeline(image, **kwargs)
-        else:
-            processed_image = image
-        ocr_results = self.ocr_engine.extract_text(processed_image)
-        if not ocr_results:
-            return self.empty_result()
-        if self.config.postprocessing_enabled:
-            nutrition_values = self.postprocessor.extract_nutrition_values(ocr_results)
-            validated_values = self.postprocessor.validate_nutrition_values(nutrition_values)
-            return self.postprocessor.structure_output(validated_values, ocr_results)
-        return {'raw_ocr_data': ocr_results}
+    fig.add_trace(
+        go.Indicator(
+            mode="gauge+number+delta",
+            value=avg_score,
+            domain={'x': [0, 1], 'y': [0, 1]},
+            title={'text': "Overall Grade"},
+            gauge={'axis': {'range': [1, 4]},
+                  'bar': {'color': "darkblue"},
+                  'steps': [{'range': [1, 2], 'color': "lightgray"},
+                           {'range': [2, 3], 'color': "gray"}],
+                  'threshold': {'line': {'color': "red", 'width': 4},
+                               'thickness': 0.75, 'value': 3.5}}
+        ),
+        row=1, col=1
+    )
     
-    def empty_result(self):
-        return {
-            'nutrition_facts': {},
-            'raw_ocr_data': [],
-            'extraction_metadata': {
-                'total_text_items': 0,
-                'average_confidence': 0,
-                'models_used': [],
-                'processing_timestamp': pd.Timestamp.now().isoformat()
-            }
-        }
+    # WHO comparison (bar chart)
+    who_percentages = [analyzer.calculate_who_percentage(nutrient, value) 
+                      for nutrient, value in nutrients.items()]
+    
+    fig.add_trace(
+        go.Bar(
+            x=['Sugar', 'Sodium', 'Saturated Fat'],
+            y=who_percentages,
+            marker_color=['red' if p > 100 else 'orange' if p > 50 else 'green' 
+                         for p in who_percentages],
+            text=[f'{p:.1f}%' for p in who_percentages],
+            textposition='auto'
+        ),
+        row=1, col=2
+    )
+    
+    # Nutrient values (scatter)
+    fig.add_trace(
+        go.Scatter(
+            x=['Sugar (g)', 'Sodium (mg)', 'Sat Fat (g)'],
+            y=[nutrients['sugar'], nutrients['sodium'], nutrients['saturated_fat']],
+            mode='markers+text',
+            marker=dict(size=20, color=[analyzer.get_grade_color(analyzer.get_grade(nutrient, value)) 
+                                       for nutrient, value in nutrients.items()]),
+            text=grades,
+            textposition="middle center",
+            textfont=dict(color="white", size=14)
+        ),
+        row=2, col=1
+    )
+    
+    # Risk assessment (pie)
+    risk_levels = [grade for grade in grades]
+    risk_counts = {level: risk_levels.count(level) for level in ['A', 'B', 'C', 'D']}
+    
+    fig.add_trace(
+        go.Pie(
+            labels=list(risk_counts.keys()),
+            values=list(risk_counts.values()),
+            marker_colors=[analyzer.get_grade_color(grade) for grade in risk_counts.keys()]
+        ),
+        row=2, col=2
+    )
+    
+    fig.update_layout(height=800, showlegend=False, title_text="NutriGrade Analysis Dashboard")
+    return fig
 
 def main():
-    st.set_page_config(page_title="NutriGrade Vision", page_icon="🏷️", layout="wide")
-    st.markdown("<h1 style='text-align: center;'>🏷️ NutriGrade Vision</h1>", unsafe_allow_html=True)
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>🏷️ NutriGrade Vision</h1>
+        <p>Aplikasi Pendeteksi Kandungan Gizi Negatif dari Kemasan Makanan atau Minuman</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    config = OCRConfig(model_type="paddleocr", language=['id', 'en'], use_gpu=False)
-    ocr_system = EnhancedNutritionOCR(config)
+    # Initialize analyzer
+    analyzer = NutrientAnalyzer()
     
-    input_method = st.sidebar.radio("Metode Input:", ["📁 Upload Gambar", "📸 Kamera", "📝 Input Manual"])
+    # Sidebar untuk konfigurasi
+    with st.sidebar:
+        st.header("⚙️ Pengaturan")
+        
+        # Health condition selector
+        health_condition = st.selectbox(
+            "Kondisi Kesehatan:",
+            ["Tidak ada", "Diabetes Mellitus", "Hipertensi", "Dislipidemia", 
+             "Anak-anak", "Ibu Hamil & Menyusui"]
+        )
+        
+        # Input method selector
+        input_method = st.radio(
+            "Metode Input:",
+            ["📁 Upload Gambar", "📸 Kamera", "📝 Input Manual"]
+        )
+        
+        st.markdown("---")
+        st.markdown("### 📊 Sistem Grading")
+        st.markdown("""
+        - **Grade A** ✅: Sangat Baik
+        - **Grade B** 🟡: Baik
+        - **Grade C** 🟠: Perlu Perhatian
+        - **Grade D** 🔴: Tinggi
+        """)
     
-    if input_method == "📁 Upload Gambar":
-        uploaded_file = st.file_uploader("Pilih gambar label gizi:", type=['jpg', 'jpeg', 'png'])
-        if uploaded_file:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Gambar yang diupload", use_column_width=True)
-            if st.button("🔍 Analisis Gambar"):
-                with st.spinner("Memproses gambar..."):
-                    image_array = np.array(image)
-                    image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
-                    result = ocr_system.process_image_array(image_array)
-                    st.subheader("📄 Hasil Ekstraksi Awal:")
-                    extracted_text = '\n'.join([item['text'] for item in result['raw_ocr_data']])
-                    edited_text = st.text_area("Edit Hasil Ekstraksi:", value=extracted_text, height=200)
-                    
-                    if st.button("💾 Simpan Perubahan"):
-                        edited_data = [{'text': line, 'confidence': 1.0, 'bbox': None, 'model': 'manual'} 
-                                     for line in edited_text.split('\n') if line.strip()]
-                        edited_result = ocr_system.postprocessor.structure_output(
-                            ocr_system.postprocessor.extract_nutrition_values(edited_data),
-                            edited_data
-                        )
-                        st.subheader("📊 Hasil Akhir:")
-                        st.json(edited_result)
+    # Main content area
+    col1, col2 = st.columns([2, 1])
     
-    elif input_method == "📸 Kamera":
-        camera_image = st.camera_input("Ambil foto label gizi")
-        if camera_image:
-            image = Image.open(camera_image)
-            st.image(image, caption="Foto dari kamera", use_column_width=True)
-            if st.button("🔍 Analisis Foto"):
-                with st.spinner("Memproses foto..."):
-                    image_array = np.array(image)
-                    image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
-                    result = ocr_system.process_image_array(image_array)
-                    st.subheader("📄 Hasil Ekstraksi Awal:")
-                    extracted_text = '\n'.join([item['text'] for item in result['raw_ocr_data']])
-                    edited_text = st.text_area("Edit Hasil Ekstraksi:", value=extracted_text, height=200)
-                    
-                    if st.button("💾 Simpan Perubahan"):
-                        edited_data = [{'text': line, 'confidence': 1.0, 'bbox': None, 'model': 'manual'} 
-                                     for line in edited_text.split('\n') if line.strip()]
-                        edited_result = ocr_system.postprocessor.structure_output(
-                            ocr_system.postprocessor.extract_nutrition_values(edited_data),
-                            edited_data
-                        )
-                        st.subheader("📊 Hasil Akhir:")
-                        st.json(edited_result)
+    with col1:
+        st.header("📱 Input Data")
+        
+        nutrients = None
+        
+        if input_method == "📁 Upload Gambar":
+            uploaded_file = st.file_uploader(
+                "Pilih gambar label gizi:", 
+                type=['jpg', 'jpeg', 'png'],
+                help="Upload foto label nutrisi dari kemasan makanan atau minuman"
+            )
+            
+            if uploaded_file is not None:
+                image = Image.open(uploaded_file)
+                st.image(image, caption="Gambar yang diupload", use_column_width=True)
+                
+                if st.button("🔍 Analisis Gambar"):
+                    with st.spinner("Memproses gambar..."):
+                        # Preprocess image
+                        processed_image = preprocess_image(image)
+                        
+                        # OCR simulation
+                        extracted_text = simulate_ocr(processed_image)
+                        
+                        st.subheader("📄 Teks yang Diekstrak:")
+                        st.text_area("OCR Result:", extracted_text, height=100)
+                        
+                        # Extract nutrients
+                        nutrients = analyzer.extract_nutrients_from_text(extracted_text)
+        
+        elif input_method == "📸 Kamera":
+            st.info("💡 Fitur kamera akan tersedia dalam versi production dengan streamlit-camera-input")
+            
+            # Placeholder untuk demo
+            if st.button("📸 Simulasi Capture"):
+                sample_text = "Nutrition Facts\nTotal Sugar: 8g\nSodium: 450mg\nSaturated Fat: 1.5g"
+                nutrients = analyzer.extract_nutrients_from_text(sample_text)
+        
+        elif input_method == "📝 Input Manual":
+            st.subheader("Input Nilai Gizi Manual")
+            
+            col_sugar, col_sodium, col_fat = st.columns(3)
+            
+            with col_sugar:
+                sugar = st.number_input("Gula (gram):", min_value=0.0, step=0.1)
+            
+            with col_sodium:
+                sodium = st.number_input("Sodium (mg):", min_value=0.0, step=1.0)
+            
+            with col_fat:
+                sat_fat = st.number_input("Lemak Jenuh (gram):", min_value=0.0, step=0.1)
+            
+            if st.button("📊 Analisis Manual"):
+                nutrients = {
+                    'sugar': sugar,
+                    'sodium': sodium,
+                    'saturated_fat': sat_fat
+                }
     
-    elif input_method == "📝 Input Manual":
-        st.subheader("Input Nilai Gizi Manual")
-        manual_text = st.text_area("Masukkan teks label gizi:", height=200)
-        if st.button("📊 Analisis Manual"):
-            if manual_text:
-                manual_data = [{'text': line, 'confidence': 1.0, 'bbox': None, 'model': 'manual'} 
-                             for line in manual_text.split('\n') if line.strip()]
-                result = ocr_system.postprocessor.structure_output(
-                    ocr_system.postprocessor.extract_nutrition_values(manual_data),
-                    manual_data
-                )
-                st.subheader("📊 Hasil Analisis:")
-                st.json(result)
+    with col2:
+        st.header("ℹ️ Informasi")
+        
+        # Consumption simulator
+        st.subheader("🧮 Simulasi Konsumsi")
+        servings = st.number_input("Jumlah kemasan:", min_value=1, max_value=10, value=1)
+        
+        # Educational content
+        with st.expander("📚 Edukasi Gizi"):
+            st.markdown("""
+            **Nama Alternatif Gula:**
+            - Sucrose, Glucose, Fructose
+            - Corn Syrup, Dextrose, Maltose
+            - Madu, Sirup
+            
+            **Nama Alternatif Sodium:**
+            - Natrium, Na, Salt, Garam
+            - MSG, Monosodium Glutamate
+            
+            **Lemak Jenuh:**
+            - Saturated Fat, Lemak Jenuh
+            - Trans Fat, Lemak Trans
+            """)
+    
+    # Results section
+    if nutrients:
+        st.markdown("---")
+        st.header("📊 Hasil Analisis")
+        
+        # Adjust for multiple servings
+        adjusted_nutrients = {k: v * servings for k, v in nutrients.items()}
+        
+        # Create grade cards
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            grade = analyzer.get_grade('sugar', adjusted_nutrients['sugar'])
+            emoji = analyzer.get_grade_emoji(grade)
+            st.markdown(f"""
+            <div class="grade-card grade-{grade.lower()}">
+                <h3>{emoji} Gula</h3>
+                <h2>Grade {grade}</h2>
+                <p>{adjusted_nutrients['sugar']:.1f}g</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            grade = analyzer.get_grade('sodium', adjusted_nutrients['sodium'])
+            emoji = analyzer.get_grade_emoji(grade)
+            st.markdown(f"""
+            <div class="grade-card grade-{grade.lower()}">
+                <h3>{emoji} Sodium</h3>
+                <h2>Grade {grade}</h2>
+                <p>{adjusted_nutrients['sodium']:.1f}mg</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            grade = analyzer.get_grade('saturated_fat', adjusted_nutrients['saturated_fat'])
+            emoji = analyzer.get_grade_emoji(grade)
+            st.markdown(f"""
+            <div class="grade-card grade-{grade.lower()}">
+                <h3>{emoji} Lemak Jenuh</h3>
+                <h2>Grade {grade}</h2>
+                <p>{adjusted_nutrients['saturated_fat']:.1f}g</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # WHO Daily Limit Comparison
+        st.subheader("📈 Perbandingan Batas Harian WHO")
+        
+        who_data = []
+        for nutrient, value in adjusted_nutrients.items():
+            percentage = analyzer.calculate_who_percentage(nutrient, value)
+            who_data.append({
+                'Nutrisi': nutrient.replace('_', ' ').title(),
+                'Nilai': f"{value:.1f}{'g' if nutrient != 'sodium' else 'mg'}",
+                'Batas WHO': f"{analyzer.who_limits[nutrient]}{'g' if nutrient != 'sodium' else 'mg'}",
+                'Persentase': f"{percentage:.1f}%",
+                'Status': '⚠️ Melebihi' if percentage > 100 else '✅ Aman'
+            })
+        
+        df = pd.DataFrame(who_data)
+        st.dataframe(df, use_container_width=True)
+        
+        # Health recommendations
+        if health_condition != "Tidak ada":
+            recommendations = analyzer.get_health_recommendation(adjusted_nutrients, health_condition)
+            
+            if recommendations:
+                st.subheader("🩺 Rekomendasi Kesehatan")
+                for rec in recommendations:
+                    st.markdown(f"""
+                    <div class="warning-box">
+                        <strong>{health_condition}:</strong><br>
+                        {rec}
+                    </div>
+                    """, unsafe_allow_html=True)
+        
+        # Visualization
+        st.subheader("📊 Visualisasi Data")
+        fig = create_visualization(adjusted_nutrients, analyzer)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Export functionality
+        st.subheader("💾 Export Hasil")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📄 Download PDF Report"):
+                st.info("Fitur download PDF akan tersedia dalam versi production")
+        
+        with col2:
+            if st.button("📊 Download Excel Data"):
+                st.info("Fitur download Excel akan tersedia dalam versi production")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style="text-align: center; color: #666; padding: 2rem;">
+        <p>🏷️ NutriGrade Vision | Membantu Anda Membuat Pilihan Makanan atau Minuman yang Lebih Sehat</p>
+        <p><small>Dikembangkan dengan ❤️ menggunakan Streamlit & Python</small></p>
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
