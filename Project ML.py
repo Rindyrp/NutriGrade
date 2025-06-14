@@ -3,14 +3,26 @@ import cv2
 import numpy as np
 import pandas as pd
 import re
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
+import paddleocr
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import json
-from typing import Dict, List, Tuple, Optional
+import logging
+from typing import Dict, List, Tuple, Optional, Any
 import io
 import base64
+from dataclasses import dataclass
+from pathlib import Path
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import warnings
+warnings.filterwarnings('ignore')
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Konfigurasi halaman
 st.set_page_config(
@@ -57,9 +69,176 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+@dataclass
+class OCRConfig:
+    """Configuration class for OCR system"""
+    model_type: str = "paddleocr"
+    language: List[str] = None
+    use_gpu: bool = False  # Set to False for CPU-only
+    confidence_threshold: float = 0.5
+    preprocessing_enabled: bool = True
+    postprocessing_enabled: bool = True
+    
+    def __post_init__(self):
+        if self.language is None:
+            self.language = ['id', 'en']  # Indonesian and English
+
+class AdvancedImagePreprocessor:
+    """Advanced image preprocessing for nutrition label OCR"""
+    
+    def __init__(self):
+        self.setup_filters()
+    
+    def setup_filters(self):
+        """Setup various filters and kernels"""
+        self.sharpen_kernel = np.array([[-1,-1,-1],
+                                       [-1, 9,-1],
+                                       [-1,-1,-1]])
+        
+        self.edge_kernel = np.array([[-1,-1,-1,-1,-1],
+                                    [-1, 2, 2, 2,-1],
+                                    [-1, 2, 8, 2,-1],
+                                    [-1, 2, 2, 2,-1],
+                                    [-1,-1,-1,-1,-1]]) / 8.0
+    
+    def detect_document_corners(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """Detect corners of document/label for perspective correction"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 50, 200, apertureSize=3)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+            epsilon = 0.02 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            
+            if len(approx) == 4:
+                return approx.reshape(4, 2)
+        
+        return None
+    
+    def perspective_correction(self, image: np.ndarray) -> np.ndarray:
+        """Apply perspective correction to straighten the document"""
+        corners = self.detect_document_corners(image)
+        
+        if corners is None:
+            return image
+        
+        rect = np.zeros((4, 2), dtype="float32")
+        s = corners.sum(axis=1)
+        rect[0] = corners[np.argmin(s)]
+        rect[2] = corners[np.argmax(s)]
+        diff = np.diff(corners, axis=1)
+        rect[1] = corners[np.argmin(diff)]
+        rect[3] = corners[np.argmax(diff)]
+        
+        width_a = np.sqrt(((rect[2][0] - rect[3][0]) ** 2) + ((rect[2][1] - rect[3][1]) ** 2))
+        width_b = np.sqrt(((rect[1][0] - rect[0][0]) ** 2) + ((rect[1][1] - rect[0][1]) ** 2))
+        max_width = max(int(width_a), int(width_b))
+        
+        height_a = np.sqrt(((rect[1][0] - rect[2][0]) ** 2) + ((rect[1][1] - rect[2][1]) ** 2))
+        height_b = np.sqrt(((rect[0][0] - rect[3][0]) ** 2) + ((rect[0][1] - rect[3][1]) ** 2))
+        max_height = max(int(height_a), int(height_b))
+        
+        dst = np.array([
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1]
+        ], dtype="float32")
+        
+        matrix = cv2.getPerspectiveTransform(rect, dst)
+        warped = cv2.warpPerspective(image, matrix, (max_width, max_height))
+        
+        return warped
+    
+    def adaptive_lighting_correction(self, image: np.ndarray) -> np.ndarray:
+        """Advanced lighting correction using multiple techniques"""
+        if len(image.shape) == 3:
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            enhanced = cv2.merge([l, a, b])
+            result = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+        else:
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            result = clahe.apply(image)
+        
+        return result
+    
+    def remove_glare_and_shadows(self, image: np.ndarray) -> np.ndarray:
+        """Remove glare and shadows using morphological operations"""
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+        opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+        result = cv2.absdiff(gray, opened)
+        result = cv2.normalize(result, None, 0, 255, cv2.NORM_MINMAX)
+        
+        return result
+    
+    def advanced_denoising(self, image: np.ndarray) -> np.ndarray:
+        """Apply advanced denoising techniques"""
+        if len(image.shape) == 3:
+            denoised = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
+        else:
+            denoised = cv2.fastNlMeansDenoising(image, None, 10, 7, 21)
+        
+        denoised = cv2.bilateralFilter(denoised, 9, 75, 75)
+        return denoised
+    
+    def enhance_text_contrast(self, image: np.ndarray) -> np.ndarray:
+        """Enhance text contrast specifically"""
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        adaptive_mean = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+                                            cv2.THRESH_BINARY, 11, 2)
+        adaptive_gaussian = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                cv2.THRESH_BINARY, 11, 2)
+        combined = cv2.bitwise_and(otsu, cv2.bitwise_and(adaptive_mean, adaptive_gaussian))
+        
+        return combined
+    
+    def apply_sharpening(self, image: np.ndarray) -> np.ndarray:
+        """Apply intelligent sharpening"""
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        gaussian = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        unsharp_mask = cv2.addWeighted(gray, 1.5, gaussian, -0.5, 0)
+        sharpened = cv2.filter2D(unsharp_mask, -1, self.sharpen_kernel)
+        
+        return sharpened
+    
+    def preprocess_pipeline(self, image: np.ndarray) -> np.ndarray:
+        """Complete preprocessing pipeline"""
+        try:
+            processed = image.copy()
+            processed = self.perspective_correction(processed)
+            processed = self.adaptive_lighting_correction(processed)
+            processed = self.remove_glare_and_shadows(processed)
+            processed = self.advanced_denoising(processed)
+            processed = self.apply_sharpening(processed)
+            processed = self.enhance_text_contrast(processed)
+            logger.info("Preprocessing pipeline completed successfully")
+            return processed
+        except Exception as e:
+            logger.error(f"Preprocessing failed: {str(e)}")
+            return image
+
 class NutrientAnalyzer:
     def __init__(self):
-        # Definisi nama alternatif nutrisi
         self.nutrient_aliases = {
             'sugar': ['total sugar', 'total sugars', 'sucrose', 'glucose', 'fructose', 
                      'corn syrup', 'added sugar', 'madu', 'sirup', 'fruktosa', 
@@ -70,18 +249,16 @@ class NutrientAnalyzer:
                             'lemak trans', 'trans fat']
         }
         
-        # Threshold untuk grading
         self.thresholds = {
             'sugar': {'A': 1, 'B': 5, 'C': 10},
             'sodium': {'A': 300, 'B': 340, 'C': 370},
             'saturated_fat': {'A': 0.7, 'B': 1.2, 'C': 2.8}
         }
         
-        # Batas harian WHO
         self.who_limits = {
-            'sugar': 25,  # gram
-            'sodium': 2000,  # mg
-            'saturated_fat': 20  # gram (untuk diet 2000 kcal)
+            'sugar': 25,
+            'sodium': 2000,
+            'saturated_fat': 20
         }
     
     def extract_nutrients_from_text(self, text: str) -> Dict[str, float]:
@@ -89,7 +266,6 @@ class NutrientAnalyzer:
         nutrients = {'sugar': 0, 'sodium': 0, 'saturated_fat': 0}
         text = text.lower()
         
-        # Pattern untuk menangkap angka dengan satuan
         patterns = {
             'sugar': r'(?:' + '|'.join(self.nutrient_aliases['sugar']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*g',
             'sodium': r'(?:' + '|'.join(self.nutrient_aliases['sodium']) + r')\s*:?\s*(\d+(?:\.\d+)?)\s*mg',
@@ -99,7 +275,6 @@ class NutrientAnalyzer:
         for nutrient, pattern in patterns.items():
             matches = re.findall(pattern, text, re.IGNORECASE)
             if matches:
-                # Ambil nilai tertinggi jika ada multiple matches
                 nutrients[nutrient] = max([float(match) for match in matches])
         
         return nutrients
@@ -160,46 +335,22 @@ class NutrientAnalyzer:
         
         return recommendations
 
-def preprocess_image(image: Image.Image) -> Image.Image:
+def preprocess_image(image: Image.Image) -> np.ndarray:
     """Preprocessing gambar untuk meningkatkan akurasi OCR"""
-    # Convert ke array numpy
+    preprocessor = AdvancedImagePreprocessor()
     img_array = np.array(image)
-    
-    # Convert ke grayscale jika berwarna
-    if len(img_array.shape) == 3:
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    else:
-        gray = img_array
-    
-    # Noise reduction
-    denoised = cv2.medianBlur(gray, 3)
-    
-    # Contrast enhancement
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    enhanced = clahe.apply(denoised)
-    
-    # Thresholding
-    _, threshold = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    return Image.fromarray(threshold)
+    processed_array = preprocessor.preprocess_pipeline(img_array)
+    return processed_array
 
-def simulate_ocr(image: Image.Image) -> str:
-    """Simulasi OCR - dalam implementasi nyata, gunakan EasyOCR atau Tesseract"""
-    # Ini adalah simulasi - replace dengan OCR engine sebenarnya
-    sample_texts = [
-        "Nutrition Facts\nTotal Sugar: 12g\nSodium: 850mg\nSaturated Fat: 3.2g",
-        "Informasi Nilai Gizi\nGula Total: 8g\nNatrium: 450mg\nLemak Jenuh: 1.5g",
-        "Kandungan Gizi\nSucrose: 15g\nGaram: 920mg\nLemak Trans: 2.1g"
-    ]
-    
-    # Return random sample text for demo
-    import random
-    return random.choice(sample_texts)
+def perform_ocr(image_array: np.ndarray) -> str:
+    """Perform OCR using PaddleOCR"""
+    ocr = paddleocr.PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
+    result = ocr.ocr(image_array, cls=True)
+    text = ' '.join([line[1][0] for line in result[0]]) if result and result[0] else ""
+    return text
 
 def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer):
     """Membuat visualisasi hasil analisis"""
-    
-    # Buat subplot
     fig = make_subplots(
         rows=2, cols=2,
         subplot_titles=('', 'WHO Daily Limit Comparison', 
@@ -208,7 +359,6 @@ def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer
                [{"type": "scatter"}, {"type": "pie"}]]
     )
     
-    # Grade overview (indicator)
     grades = [analyzer.get_grade(nutrient, value) for nutrient, value in nutrients.items()]
     grade_scores = {'A': 4, 'B': 3, 'C': 2, 'D': 1}
     avg_score = sum(grade_scores[grade] for grade in grades) / len(grades)
@@ -229,7 +379,6 @@ def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer
         row=1, col=1
     )
     
-    # WHO comparison (bar chart)
     who_percentages = [analyzer.calculate_who_percentage(nutrient, value) 
                       for nutrient, value in nutrients.items()]
     
@@ -245,7 +394,6 @@ def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer
         row=1, col=2
     )
     
-    # Nutrient values (scatter)
     fig.add_trace(
         go.Scatter(
             x=['Sugar (g)', 'Sodium (mg)', 'Sat Fat (g)'],
@@ -260,7 +408,6 @@ def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer
         row=2, col=1
     )
     
-    # Risk assessment (pie)
     risk_levels = [grade for grade in grades]
     risk_counts = {level: risk_levels.count(level) for level in ['A', 'B', 'C', 'D']}
     
@@ -277,7 +424,6 @@ def create_visualization(nutrients: Dict[str, float], analyzer: NutrientAnalyzer
     return fig
 
 def main():
-    # Header
     st.markdown("""
     <div class="main-header">
         <h1>🏷️ NutriGrade Vision</h1>
@@ -285,26 +431,19 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
-    # Initialize analyzer
     analyzer = NutrientAnalyzer()
     
-    # Sidebar untuk konfigurasi
     with st.sidebar:
         st.header("⚙️ Pengaturan")
-        
-        # Health condition selector
         health_condition = st.selectbox(
             "Kondisi Kesehatan:",
             ["Tidak ada", "Diabetes Mellitus", "Hipertensi", "Dislipidemia", 
              "Anak-anak", "Ibu Hamil & Menyusui"]
         )
-        
-        # Input method selector
         input_method = st.radio(
             "Metode Input:",
             ["📁 Upload Gambar", "📸 Kamera", "📝 Input Manual"]
         )
-        
         st.markdown("---")
         st.markdown("### 📊 Sistem Grading")
         st.markdown("""
@@ -314,12 +453,10 @@ def main():
         - **Grade D** 🔴: Tinggi
         """)
     
-    # Main content area
     col1, col2 = st.columns([2, 1])
     
     with col1:
         st.header("📱 Input Data")
-        
         nutrients = None
         
         if input_method == "📁 Upload Gambar":
@@ -335,37 +472,27 @@ def main():
                 
                 if st.button("🔍 Analisis Gambar"):
                     with st.spinner("Memproses gambar..."):
-                        # Preprocess image
                         processed_image = preprocess_image(image)
-                        
-                        # OCR simulation
-                        extracted_text = simulate_ocr(processed_image)
+                        extracted_text = perform_ocr(processed_image)
                         
                         st.subheader("📄 Teks yang Diekstrak:")
                         st.text_area("OCR Result:", extracted_text, height=100)
-                        
-                        # Extract nutrients
                         nutrients = analyzer.extract_nutrients_from_text(extracted_text)
         
         elif input_method == "📸 Kamera":
             st.info("💡 Fitur kamera akan tersedia dalam versi production dengan streamlit-camera-input")
-            
-            # Placeholder untuk demo
             if st.button("📸 Simulasi Capture"):
                 sample_text = "Nutrition Facts\nTotal Sugar: 8g\nSodium: 450mg\nSaturated Fat: 1.5g"
                 nutrients = analyzer.extract_nutrients_from_text(sample_text)
         
         elif input_method == "📝 Input Manual":
             st.subheader("Input Nilai Gizi Manual")
-            
             col_sugar, col_sodium, col_fat = st.columns(3)
             
             with col_sugar:
                 sugar = st.number_input("Gula (gram):", min_value=0.0, step=0.1)
-            
             with col_sodium:
                 sodium = st.number_input("Sodium (mg):", min_value=0.0, step=1.0)
-            
             with col_fat:
                 sat_fat = st.number_input("Lemak Jenuh (gram):", min_value=0.0, step=0.1)
             
@@ -378,12 +505,9 @@ def main():
     
     with col2:
         st.header("ℹ️ Informasi")
-        
-        # Consumption simulator
         st.subheader("🧮 Simulasi Konsumsi")
         servings = st.number_input("Jumlah kemasan:", min_value=1, max_value=10, value=1)
         
-        # Educational content
         with st.expander("📚 Edukasi Gizi"):
             st.markdown("""
             **Nama Alternatif Gula:**
@@ -400,15 +524,12 @@ def main():
             - Trans Fat, Lemak Trans
             """)
     
-    # Results section
     if nutrients:
         st.markdown("---")
         st.header("📊 Hasil Analisis")
         
-        # Adjust for multiple servings
         adjusted_nutrients = {k: v * servings for k, v in nutrients.items()}
         
-        # Create grade cards
         col1, col2, col3 = st.columns(3)
         
         with col1:
@@ -444,9 +565,7 @@ def main():
             </div>
             """, unsafe_allow_html=True)
         
-        # WHO Daily Limit Comparison
         st.subheader("📈 Perbandingan Batas Harian WHO")
-        
         who_data = []
         for nutrient, value in adjusted_nutrients.items():
             percentage = analyzer.calculate_who_percentage(nutrient, value)
@@ -461,10 +580,8 @@ def main():
         df = pd.DataFrame(who_data)
         st.dataframe(df, use_container_width=True)
         
-        # Health recommendations
         if health_condition != "Tidak ada":
             recommendations = analyzer.get_health_recommendation(adjusted_nutrients, health_condition)
-            
             if recommendations:
                 st.subheader("🩺 Rekomendasi Kesehatan")
                 for rec in recommendations:
@@ -475,24 +592,19 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
         
-        # Visualization
         st.subheader("📊 Visualisasi Data")
         fig = create_visualization(adjusted_nutrients, analyzer)
         st.plotly_chart(fig, use_container_width=True)
         
-        # Export functionality
         st.subheader("💾 Export Hasil")
         col1, col2 = st.columns(2)
-        
         with col1:
             if st.button("📄 Download PDF Report"):
                 st.info("Fitur download PDF akan tersedia dalam versi production")
-        
         with col2:
             if st.button("📊 Download Excel Data"):
                 st.info("Fitur download Excel akan tersedia dalam versi production")
     
-    # Footer
     st.markdown("---")
     st.markdown("""
     <div style="text-align: center; color: #666; padding: 2rem;">
